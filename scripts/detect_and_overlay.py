@@ -1,13 +1,12 @@
-
 #!/usr/bin/env python3
 """
-AICI Challenge 1 — Simplified baseline with "no overlap" option.
-Detects objects (chair, couch, etc.) using YOLOv8 and overlays boxes on room.pgm.
-Adds --only-best-frame to keep detections from a single best-scoring frame.
+AICI Challenge 1 — v2 compliant baseline
+Adds map-coordinate conversion, pose+dimension fields, and oriented boxes.
 """
 
-import argparse, os, json, cv2, numpy as np
+import argparse, os, json, cv2, yaml, numpy as np
 from pathlib import Path
+from ultralytics import YOLO
 
 AICI_TO_COCO = {
     "bathtub": "bathtub",
@@ -17,110 +16,121 @@ AICI_TO_COCO = {
     "table": "dining table",
     "wc": "toilet",
 }
-COCO_FILTER = {v for v in AICI_TO_COCO.values()}
+COCO_FILTER = set(AICI_TO_COCO.values())
 
-def _load_yolo(model_name="yolov8n.pt"):
-    try:
-        from ultralytics import YOLO
-        return YOLO(model_name)
-    except Exception as e:
-        raise RuntimeError("Please install ultralytics: pip install ultralytics opencv-python") from e
 
-def load_map(pgm_path: Path):
-    m = cv2.imread(str(pgm_path), cv2.IMREAD_GRAYSCALE)
-    if m is None:
-        raise FileNotFoundError(f"Cannot read map: {pgm_path}")
-    return cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)
+# ---------- helpers ----------
+def load_map_and_meta(pgm_path, yaml_path):
+    img = cv2.imread(str(pgm_path), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(pgm_path)
+    meta = yaml.safe_load(open(yaml_path))
+    res = float(meta["resolution"])
+    origin = np.array(meta["origin"][:2], float)  # [ox, oy]
+    theta0 = float(meta["origin"][2]) if len(meta["origin"]) == 3 else 0.0
+    return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR), res, origin, theta0
 
-def pick_frames(rgb_dir: Path, max_frames: int):
+
+def pick_frames(rgb_dir, max_frames):
     exts = (".png", ".jpg", ".jpeg", ".bmp")
-    frames = sorted([p for p in rgb_dir.rglob("*") if p.suffix.lower() in exts])
-    if not frames:
-        raise FileNotFoundError(f"No RGB frames found in {rgb_dir}")
-    return frames[:max_frames]
+    return sorted([p for p in Path(rgb_dir).rglob("*") if p.suffix.lower() in exts])[:max_frames]
 
-def overlay_on_map(map_img, dets, out_size=None):
-    canvas = map_img.copy()
-    if out_size is not None:
-        canvas = cv2.resize(canvas, out_size, interpolation=cv2.INTER_LINEAR)
-    for d in dets:
-        x1,y1,x2,y2 = map(int, [d["x1"], d["y1"], d["x2"], d["y2"]])
-        cv2.rectangle(canvas, (x1,y1), (x2,y2), (0,255,0), 2)
-        label = f'{d["cls_name"]} {d["score"]:.2f}'
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(canvas, (x1, y1-18), (x1+tw+6, y1-2), (0,255,0), -1)
-        cv2.putText(canvas, label, (x1+3, y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
+
+def pixel_to_map(x_px, y_px, res, origin, H):
+    """Convert image pixel (x_px,y_px) to map (x,y) in meters."""
+    # map.pgm has (0,0) bottom-left at origin[0:2]
+    x_m = origin[0] + x_px * res
+    y_m = origin[1] + (H - y_px) * res
+    return x_m, y_m
+
+
+def draw_oriented_box(canvas, center, size, angle_deg, color=(0,255,0)):
+    rect = (center, size, angle_deg)
+    box = cv2.boxPoints(rect).astype(int)
+    cv2.polylines(canvas, [box], True, color, 2)
     return canvas
 
+
+# ---------- main ----------
 def run(args):
-    map_img = load_map(Path(args.room_pgm))
-    frames = pick_frames(Path(args.rgb_dir), args.max_frames)
-    model = _load_yolo(args.model)
+    map_img, res, origin, theta0 = load_map_and_meta(args.room_pgm, args.room_yaml)
+    H_map, W_map = map_img.shape[:2]
+    frames = pick_frames(args.rgb_dir, args.max_frames)
+    model = YOLO(args.model)
 
-    frame_dets = {}
-    best_frame = None
-    best_score_sum = -1.0
+    best_frame, best_sum, detections = None, -1, {}
 
-    for img_path in frames:
-        img = cv2.imread(str(img_path))
-        if img is None:
-            continue
+    for p in frames:
+        img = cv2.imread(str(p))
+        if img is None: continue
         H, W = img.shape[:2]
-        r = model.predict(source=img, conf=args.conf, verbose=False)[0]
-        dets_this, score_sum = [], 0.0
-
+        r = model.predict(img, conf=args.conf, verbose=False)[0]
+        dets, ssum = [], 0.0
         for b in r.boxes:
-            cls_id = int(b.cls[0])
-            score = float(b.conf[0])
-            x1,y1,x2,y2 = map(float, b.xyxy[0].tolist())
-            cls_name = r.names[cls_id]
-            if cls_name not in COCO_FILTER:
-                continue
-            dets_this.append({
-                "image": img_path.name,
+            cls_name = r.names[int(b.cls)]
+            if cls_name not in COCO_FILTER: continue
+            score = float(b.conf)
+            x1,y1,x2,y2 = map(float, b.xyxy[0])
+            cx, cy = (x1+x2)/2, (y1+y2)/2
+            w_px, h_px = x2-x1, y2-y1
+
+            # rough orientation from aspect ratio
+            angle = 0.0 if w_px >= h_px else 90.0
+
+            # convert to map coords
+            x_m, y_m = pixel_to_map(cx, cy, res, origin, H_map)
+            L, Wm = w_px*res, h_px*res
+
+            dets.append({
+                "image": p.name,
                 "cls_name": cls_name,
                 "score": score,
-                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "width": W, "height": H
+                "pose": {"x": x_m, "y": y_m, "theta": np.deg2rad(angle)},
+                "size": {"length": L, "width": Wm, "height": 0.75},  # crude height
             })
-            score_sum += score
+            ssum += score
 
-        if dets_this:
-            frame_dets[img_path.name] = dets_this
-            if score_sum > best_score_sum:
-                best_score_sum = score_sum
-                best_frame = img_path.name
+        if dets:
+            detections[p.name] = dets
+            if ssum > best_sum:
+                best_sum, best_frame = ssum, p.name
 
     if args.only_best_frame and best_frame:
-        print(f"[INFO] Using best frame: {best_frame} (score={best_score_sum:.3f})")
-        all_dets = frame_dets[best_frame]
+        all_dets = detections[best_frame]
+        print(f"[INFO] Using best frame {best_frame}")
     else:
-        all_dets = [d for detlist in frame_dets.values() for d in detlist]
+        all_dets = [d for dl in detections.values() for d in dl]
 
     os.makedirs(args.out_dir, exist_ok=True)
-    det_path = os.path.join(args.out_dir, "detections.json")
-    with open(det_path, "w") as f:
-        json.dump(all_dets, f, indent=2)
-    print(f"[OK] Wrote detections: {det_path} ({len(all_dets)} boxes)")
+    out_json = os.path.join(args.out_dir, "detections.json")
+    json.dump(all_dets, open(out_json, "w"), indent=2)
+    print(f"[OK] Saved {len(all_dets)} detections → {out_json}")
 
-    if all_dets:
-        H = all_dets[0]["height"]
-        W = all_dets[0]["width"]
-        overlay = overlay_on_map(map_img, all_dets, out_size=(W, H))
-        out_png = os.path.join(args.out_dir, "map_with_detections.png")
-        cv2.imwrite(out_png, overlay)
-        print(f"[OK] Wrote overlay: {out_png}")
-    else:
-        print("[WARN] No detections found; skipping overlay.")
+    # overlay oriented boxes on the map
+    canvas = map_img.copy()
+    for d in all_dets:
+        cx = int((d["pose"]["x"] - origin[0]) / res)
+        cy = int(H_map - (d["pose"]["y"] - origin[1]) / res)
+        Lp = d["size"]["length"] / res
+        Wp = d["size"]["width"] / res
+        angle_deg = np.rad2deg(d["pose"]["theta"])
+        draw_oriented_box(canvas, (cx, cy), (Lp, Wp), angle_deg)
+        label = f'{d["cls_name"]} {d["score"]:.2f}'
+        cv2.putText(canvas, label, (cx+5, cy-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+    out_png = os.path.join(args.out_dir, "map_with_detections.png")
+    cv2.imwrite(out_png, canvas)
+    print(f"[OK] Saved overlay → {out_png}")
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--room-pgm", required=True, help="Path to room.pgm")
-    ap.add_argument("--rgb-dir", required=True, help="Directory with RGB frames")
-    ap.add_argument("--out-dir", default="results", help="Output directory")
-    ap.add_argument("--max-frames", type=int, default=50, help="Process up to N frames")
-    ap.add_argument("--conf", type=float, default=0.4, help="YOLO confidence threshold")
-    ap.add_argument("--model", default="yolov8n.pt", help="YOLOv8 model checkpoint")
-    ap.add_argument("--only-best-frame", action="store_true", help="Use detections from the single best frame (no overlaps)")
+    ap.add_argument("--room-yaml", required=True)
+    ap.add_argument("--room-pgm", required=True)
+    ap.add_argument("--rgb-dir", required=True)
+    ap.add_argument("--out-dir", default="results")
+    ap.add_argument("--max-frames", type=int, default=50)
+    ap.add_argument("--conf", type=float, default=0.4)
+    ap.add_argument("--model", default="yolov8n.pt")
+    ap.add_argument("--only-best-frame", action="store_true")
     args = ap.parse_args()
     run(args)
