@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Challenge 2 — Point cloud concatenation & colorization (robust, CompressedImage ok)
-Fixed:
-- Avoids using `or` with NumPy arrays in TF lookups (None checks instead).
-- Handles cases where no image is found near a cloud timestamp (no img_frame reference error).
-- Adds optional per-cloud voxel downsampling to reduce RAM.
+colorize_and_merge_debug_v2.py — diagnostics + robust TF (handles /tf_static as time-agnostic)
+Key changes vs v1:
+- /tf_static transforms are stored as "static" and are usable at ANY time (ignore tolerance)
+- If time-bounded lookup fails, we retry with an infinite tolerance (best available)
+- Verbose counters for TF hits/misses (cloud and image)
 """
-
 import argparse, sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple, Dict
 import numpy as np, cv2
 from tqdm import tqdm
 
@@ -17,7 +16,6 @@ import open3d as o3d
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
 
-# ------------- utils -------------
 def ensure_dir(p: str):
     Path(p).parent.mkdir(parents=True, exist_ok=True)
 
@@ -44,7 +42,6 @@ def transform_points(T, xyz):
     pts = np.c_[xyz, np.ones((xyz.shape[0],1))]
     return (T @ pts.T).T[:,:3]
 
-# ------------- decoders -------------
 def decode_image(msg) -> Tuple[np.ndarray, str]:
     h,w = int(msg.height), int(msg.width)
     enc = msg.encoding.decode() if isinstance(msg.encoding,(bytes,bytearray)) else str(msg.encoding)
@@ -92,43 +89,72 @@ def decode_pointcloud2(msg):
         rgb=np.vstack((r,g,b)).T.astype(np.uint8)
     return xyz, rgb
 
-# ------------- TF buffer -------------
 from collections import defaultdict, deque
 class TFBuffer:
-    def __init__(self): self.store=defaultdict(deque)
-    def add(self, parent, child, t_ns, trans, rot):
+    def __init__(self):
+        self.store=defaultdict(list)     # time-varying transforms: (t_ns, T)
+        self.static_store=defaultdict(list) # time-agnostic transforms from /tf_static: (T,) list
+
+    def add(self, parent, child, t_ns, trans, rot, is_static=False):
         T=np.eye(4); T[:3,:3]=quat_to_mat(float(rot.x),float(rot.y),float(rot.z),float(rot.w))
         T[:3,3]=[float(trans.x),float(trans.y),float(trans.z)]
-        dq=self.store[(parent,child)]; dq.append((t_ns,T)); 
-        if len(dq)>800: dq.popleft()
-    def _lookup_direct(self, parent, child, t_ns, tol_ns):
-        dq=self.store.get((parent,child)); 
+        key=(parent,child)
+        if is_static:
+            self.static_store[key].append(T)
+        else:
+            self.store[key].append((t_ns,T))
+            if len(self.store[key])>2000:
+                self.store[key]=self.store[key][-1000:]
+
+    def _lookup_direct(self, parent, child, t_ns, tol_ns, ignore_time=False):
+        # time-agnostic first: any static transforms?
+        stat = self.static_store.get((parent,child))
+        if stat:
+            return stat[-1]
+        # time-varying
+        dq=self.store.get((parent,child))
         if not dq: return None
-        best=None; best_dt=None
+        if ignore_time:
+            # choose nearest in time but without enforcing tol
+            best=None; bestdt=None
+            for (tn,T) in dq:
+                dt=abs(tn - t_ns)
+                if best is None or dt<bestdt: best,bestdt=T,dt
+            return best
+        # enforce tolerance
+        best=None; bestdt=None
         for (tn,T) in dq:
-            dt=abs(tn-t_ns)
-            if best is None or dt<best_dt: best,best_dt=(T,dt),dt
-        return best[0] if (best and best_dt<=tol_ns) else None
+            dt=abs(tn - t_ns)
+            if best is None or dt<bestdt: best,bestdt=T,dt
+        return best if (best is not None and bestdt<=tol_ns) else None
+
     def lookup(self, target, source, t_ns, tol_ns=100_000_000):
         if target==source: return np.eye(4)
-        from collections import deque as Q
-        q=Q([(source,np.eye(4))]); seen={source}
-        while q:
-            frm,Ttc=q.popleft()
-            T=self._lookup_direct(target, frm, t_ns, tol_ns)
-            if T is not None: return T @ Ttc
-            for (p,c),dq in self.store.items():
-                if p==frm and c not in seen:
-                    Tpc=self._lookup_direct(p,c,t_ns,tol_ns)
-                    if Tpc is None: continue
-                    seen.add(c); q.append((c, Ttc @ np.linalg.inv(SE3(Tpc))))
-                elif c==frm and p not in seen:
-                    Tpf=self._lookup_direct(p,c,t_ns,tol_ns)
-                    if Tpf is None: continue
-                    seen.add(p); q.append((p, Ttc @ SE3(Tpf)))
-        return None
 
-# ------------- projection -------------
+        def bfs(ignore_time=False):
+            q=deque([(source,np.eye(4))]); seen={source}
+            while q:
+                frm,Ttc=q.popleft()
+                T=self._lookup_direct(target, frm, t_ns, tol_ns, ignore_time=ignore_time)
+                if T is not None: return T @ Ttc
+                # expand neighbors both directions
+                for (p,c) in set(list(self.store.keys())+list(self.static_store.keys())):
+                    if p==frm and c not in seen:
+                        Tpc=self._lookup_direct(p,c,t_ns,tol_ns, ignore_time=ignore_time)
+                        if Tpc is None: continue
+                        seen.add(c); q.append((c, Ttc @ np.linalg.inv(SE3(Tpc))))
+                    elif c==frm and p not in seen:
+                        Tcp=self._lookup_direct(p,c,t_ns,tol_ns, ignore_time=ignore_time)
+                        if Tcp is None: continue
+                        seen.add(p); q.append((p, Ttc @ SE3(Tcp)))
+            return None
+
+        # try with tolerance
+        T=bfs(ignore_time=False)
+        if T is not None: return T
+        # fallback: ignore timing (use static or nearest)
+        return bfs(ignore_time=True)
+
 def colorize_points_from_image(xyz_cam, img_bgr, K):
     fx,fy,cx,cy = K[0,0],K[1,1],K[0,2],K[1,2]
     X,Y,Z = xyz_cam[:,0],xyz_cam[:,1],xyz_cam[:,2]
@@ -139,9 +165,8 @@ def colorize_points_from_image(xyz_cam, img_bgr, K):
     m=valid & (u>=0) & (u<W) & (v>=0) & (v<H)
     colors=np.full((xyz_cam.shape[0],3),128,dtype=np.uint8)
     colors[m]=img_bgr[v[m],u[m]]
-    return colors
+    return colors, int(np.count_nonzero(m))
 
-# ------------- bag plumbing -------------
 def expand_bags(paths: List[str]) -> List[Path]:
     out=[]
     for p in paths:
@@ -178,30 +203,32 @@ def read_bags(args):
             for c in conns.get(topic, []):
                 for _,_,raw in rdr.messages(connections=[c]): yield c, raw
 
-        # TF
+        # TF with static awareness
         for tft in (args.tf_topics or []):
+            is_static = (tft.endswith('tf_static'))
             for c,raw in msgs(tft):
                 m=rdr.deserialize(raw, c.msgtype)
                 for ts in getattr(m,'transforms',[]):
                     parent = ts.header.frame_id.decode() if isinstance(ts.header.frame_id,(bytes,bytearray)) else str(ts.header.frame_id)
                     child  = ts.child_frame_id.decode() if isinstance(ts.child_frame_id,(bytes,bytearray)) else str(ts.child_frame_id)
-                    tf.add(parent, child, to_ns(ts.header.stamp), ts.transform.translation, ts.transform.rotation)
+                    tf.add(parent, child, to_ns(ts.header.stamp), ts.transform.translation, ts.transform.rotation, is_static=is_static)
 
-        # CameraInfo
+        # CameraInfo map per frame
+        cam_by_frame: Dict[str, list] = {}
         for c,raw in msgs(args.caminfo_topic):
             m=rdr.deserialize(raw, c.msgtype)
             K=np.array(m.k if hasattr(m,'k') else m.K, dtype=np.float64).reshape(3,3)
-            W,H=int(m.width),int(m.height)
             fid = m.header.frame_id.decode() if isinstance(m.header.frame_id,(bytes,bytearray)) else str(m.header.frame_id)
-            fb.caminfos.append((to_ns(m.header.stamp), K, (W,H), fid))
+            t  = to_ns(m.header.stamp)
+            cam_by_frame.setdefault(fid, []).append((t,K))
+        for fid in cam_by_frame:
+            cam_by_frame[fid].sort(key=lambda x:x[0])
 
-        # Images (handles CompressedImage)
+        # Images
         for c,raw in msgs(args.image_topic):
             m=rdr.deserialize(raw, c.msgtype)
-            if 'CompressedImage' in c.msgtype:
-                img,_=decode_compressed_image(m)
-            else:
-                img,_=decode_image(m)
+            if 'CompressedImage' in c.msgtype: img,_=decode_compressed_image(m)
+            else: img,_=decode_image(m)
             fid = m.header.frame_id.decode() if isinstance(m.header.frame_id,(bytes,bytearray)) else str(m.header.frame_id)
             fb.images.append((to_ns(m.header.stamp), img, fid))
 
@@ -218,10 +245,10 @@ def read_bags(args):
         try: rdr.close()
         except Exception: pass
 
-    fb.images.sort(key=lambda x:x[0]); fb.caminfos.sort(key=lambda x:x[0]); fb.clouds.sort(key=lambda x:x[0])
-    return fb, tf
+    fb.images.sort(key=lambda x:x[0]); fb.clouds.sort(key=lambda x:x[0])
+    return fb, tf, cam_by_frame
 
-def nearest_by_time(items, t_ns, tol_ns):
+def nearest_idx(items, t_ns, tol_ns):
     if not items: return None
     lo,hi=0,len(items)-1
     while lo<hi:
@@ -236,54 +263,98 @@ def nearest_by_time(items, t_ns, tol_ns):
     return best if bestdt <= tol_ns else None
 
 def run(args):
-    fb, tf = read_bags(args)
-    if not fb.clouds: print("[ERROR] No point clouds found.", file=sys.stderr); return 2
-    if not fb.caminfos: print("[WARN] No CameraInfo; cannot colorize.", file=sys.stderr)
-    if not fb.images: print("[WARN] No images; output will be gray.", file=sys.stderr)
-    K, cam_frame = (fb.caminfos[-1][1], fb.caminfos[-1][3]) if fb.caminfos else (None,None)
+    fb, tf, cam_by_frame = read_bags(args)
     tol_ns = int(args.sync_tol*1e9)
 
+    print(f"[INFO] clouds: {len(fb.clouds)}  images: {len(fb.images)}  camera frames: {list(cam_by_frame.keys())}")
+    if not fb.images: print("[WARN] No images found.")
+    if not cam_by_frame: print("[WARN] No CameraInfo found.")
+    if not fb.clouds: 
+        print("[ERROR] No point clouds found."); return 2
+
+    # stats
+    clouds_transformed = 0
+    clouds_colored = 0
+    total_points = 0
+    total_colored_points = 0
+    tf_cloud_ok=0; tf_cloud_fail=0; tf_img_ok=0; tf_img_fail=0
+
     ptsA=[]; rgbA=[]
+
     for (t_ns, xyz, cloud_frame) in tqdm(fb.clouds, desc="Colorizing & merging clouds"):
-        # Transform cloud into world frame
+        total_points += xyz.shape[0]
+        # TF cloud -> world (with fallback ignoring time)
         T_wc = tf.lookup(args.world_frame, cloud_frame, t_ns, tol_ns)
-        if T_wc is None and fb.clouds:
-            T_wc = tf.lookup(args.world_frame, cloud_frame, fb.clouds[0][0], tol_ns)
         if T_wc is None:
-            # If still None and world==cloud frame, just identity
+            tf_cloud_fail += 1
+            # As a last resort: identity if same frame
             if args.world_frame == cloud_frame:
                 T_wc = np.eye(4)
             else:
-                continue  # skip this cloud
+                if args.verbose:
+                    print(f"[WARN] TF miss cloud_frame='{cloud_frame}' -> world='{args.world_frame}' at t={t_ns}")
+                continue
+        else:
+            tf_cloud_ok += 1
+
+        clouds_transformed += 1
         xyz_world = transform_points(SE3(T_wc), xyz)
 
-        # Default color = gray
         colors = np.full((xyz_world.shape[0],3),128,np.uint8)
 
-        # Try to colorize if we have images & K
-        if fb.images and K is not None:
-            idx = nearest_by_time(fb.images, t_ns, tol_ns)
-            if idx is not None:
-                t_img, img_bgr, img_frame = fb.images[idx]
-                T_wc2 = tf.lookup(args.world_frame, img_frame, t_img, tol_ns)
-                if T_wc2 is None:
-                    T_wc2 = tf.lookup(args.world_frame, img_frame, t_ns, tol_ns)
-                if T_wc2 is not None:
-                    xyz_cam = transform_points(np.linalg.inv(SE3(T_wc2)), xyz_world)
-                    colors = colorize_points_from_image(xyz_cam, img_bgr, K)
+        # nearest image
+        if fb.images and cam_by_frame:
+            idx_img = nearest_idx(fb.images, t_ns, tol_ns)
+            if idx_img is not None:
+                t_img, img_bgr, img_frame = fb.images[idx_img]
 
-        # Per-cloud downsample before merging (to keep RAM low)
-        if args.percloud_voxel and args.percloud_voxel > 0:
-            v = float(args.percloud_voxel)
-            q = np.floor(xyz_world / v).astype(np.int64)
-            _, keep_idx = np.unique(q, axis=0, return_index=True)
-            keep_idx.sort()
-            xyz_world = xyz_world[keep_idx]
-            colors = colors[keep_idx]
+                # match CameraInfo by frame
+                cams = cam_by_frame.get(img_frame, [])
+                if not cams:
+                    # take any available camera if direct frame missing
+                    # choose the one with most entries
+                    k_best = None
+                    for fid, lst in cam_by_frame.items():
+                        if k_best is None or len(lst) > len(cam_by_frame[k_best]): k_best = fid
+                    cams = cam_by_frame.get(k_best, [])
+
+                idx_cam = nearest_idx(cams, t_img, tol_ns)
+                K = cams[idx_cam][1] if idx_cam is not None else None
+
+                T_wc2 = tf.lookup(args.world_frame, img_frame, t_img, tol_ns)
+                if T_wc2 is None and img_frame:
+                    T_wc2 = tf.lookup(args.world_frame, img_frame, t_ns, tol_ns)
+
+                if T_wc2 is None:
+                    tf_img_fail += 1
+                else:
+                    tf_img_ok += 1
+
+                if args.verbose:
+                    print(f"[DBG] img_frame='{img_frame}'  K={'ok' if K is not None else 'NONE'}  TF_img={'ok' if T_wc2 is not None else 'NONE'}")
+
+                if (K is not None) and (T_wc2 is not None):
+                    xyz_cam = transform_points(np.linalg.inv(SE3(T_wc2)), xyz_world)
+                    cols, nproj = colorize_points_from_image(xyz_cam, img_bgr, K)
+                    if nproj > 0:
+                        colors = cols
+                        clouds_colored += 1
+                        total_colored_points += nproj
 
         ptsA.append(xyz_world.astype(np.float32)); rgbA.append(colors.astype(np.uint8))
 
-    if not ptsA: print("[ERROR] After TF/sync, zero points remained.", file=sys.stderr); return 3
+    print(f"[STATS] clouds_in={len(fb.clouds)}  transformed={clouds_transformed}  colored_clouds={clouds_colored}")
+    print(f"[STATS] points_total={total_points}  colored_points~={total_colored_points}")
+    print(f"[STATS] TF cloud ok/fail: {tf_cloud_ok}/{tf_cloud_fail}  TF img ok/fail: {tf_img_ok}/{tf_img_fail}")
+
+    if args.dry_run:
+        print("[OK] Dry run only. Not writing PLY.")
+        return 0
+
+    if not ptsA: 
+        print("[ERROR] After TF/sync, zero points remained."); 
+        return 3
+
     pts=np.concatenate(ptsA,0); rgb=np.concatenate(rgbA,0)
     pcd=o3d.geometry.PointCloud()
     pcd.points=o3d.utility.Vector3dVector(pts.astype(np.float64))
@@ -291,24 +362,24 @@ def run(args):
     if args.voxel and args.voxel>0: pcd=pcd.voxel_down_sample(float(args.voxel))
     ensure_dir(args.out); o3d.io.write_point_cloud(args.out, pcd, write_ascii=False, compressed=False)
     print(f"[OK] Wrote colored point cloud → {args.out}")
-    print(f"[INFO] Points: {np.asarray(pcd.points).shape[0]}  (voxel={args.voxel}, percloud_voxel={args.percloud_voxel})")
     return 0
 
 def build_argparser():
-    ap = argparse.ArgumentParser(description="Concatenate & colorize point clouds from ROS bag(s).")
-    ap.add_argument("--bags", nargs="+", required=True, help="Bag folders (rosbag2) or files (*.db3/*.bag).")
-    ap.add_argument("--cloud-topic", required=True, help="PointCloud2 topic (e.g., /livox/lidar).")
-    ap.add_argument("--image-topic", required=True, help="Image/CompressedImage topic (e.g., /zed/.../image_rect_color/compressed).")
-    ap.add_argument("--caminfo-topic", required=True, help="CameraInfo topic (e.g., /zed/.../camera_info).")
+    ap = argparse.ArgumentParser(description="Concatenate & colorize point clouds from ROS bag(s) with diagnostics and robust TF.")
+    ap.add_argument("--bags", nargs="+", required=True)
+    ap.add_argument("--cloud-topic", required=True)
+    ap.add_argument("--image-topic", required=True)
+    ap.add_argument("--caminfo-topic", required=True)
     ap.add_argument("--tf-topics", nargs="*", default=["/tf","/tf_static"])
     ap.add_argument("--world-frame", default="map")
     ap.add_argument("--sync-tol", type=float, default=0.05)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--max-clouds", type=int, default=0)
-    ap.add_argument("--percloud-voxel", dest="percloud_voxel", type=float, default=0.0,
-                    help="Downsample each cloud BEFORE merging (meters).")
-    ap.add_argument("--voxel", type=float, default=0.03, help="Final downsample after merge (meters).")
+    ap.add_argument("--percloud-voxel", dest="percloud_voxel", type=float, default=0.0)
+    ap.add_argument("--voxel", type=float, default=0.03)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--verbose", action="store_true")
     return ap
 
 if __name__ == "__main__":

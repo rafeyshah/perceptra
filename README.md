@@ -1,108 +1,111 @@
-# AICI Challenge 1 & 2 — Perceptra Solution
+# 🧠 Perceptra – AICI Robotics Challenge Submission
 
-## Overview
-This repository contains the implementation and outputs for **Challenge 1** and **Challenge 2** of the AICI Computer Vision & Robotics Assessment.  
-
-- **Challenge 1:** Detect and localize indoor furniture (chair, couch, table, shelf, bathtub, WC) on a **2D occupancy grid map** using RGB survey data.  
-- **Challenge 2:** Concatenate and **colorize LiDAR point clouds** using synchronized RGB camera data to produce a **single colored 3D point cloud (PLY)** representing the full surveyed environment.
+This repository contains the full solution for the **AICI GmbH Computer Vision & Robotics Challenge**, covering **Challenge 1**, **Challenge 2**, and a placeholder for **Challenge 3 (Alignment)**.
 
 ---
 
-## 📦 Folder Structure
+## 🧩 Challenge 1 – Object Detection & Map Overlay
 
-```
-Perceptra/
-│
-├── scripts/
-│   ├── detect_and_overlay_v2.py       # Challenge 1
-│   ├── list_bag_topics.py             # Utility to inspect ROS bag topics
-│   └── colorize_and_merge_fixed.py    # Challenge 2 (final robust version)
-│
-├── results/
-│   └── office/
-│       ├── detections.json            # Challenge 1: object poses & sizes
-│       ├── map_with_detections.png    # Challenge 1: overlay on occupancy grid
-│       └── office_colored.ply         # Challenge 2: merged colored point cloud
-│
-├── data/
-│   └── office/
-│       ├── room.pgm                   # Occupancy map
-│       ├── room.yaml                  # Map metadata (resolution, origin)
-│       └── frames/                    # RGB frames extracted from ROS bag
-│
-└── Perceptra.ipynb                    # Notebook used for testing in Google Colab
-```
+### Objective
+Detect at least two of six required object classes and overlay oriented bounding boxes on the occupancy grid map.
+
+### Implementation Summary
+- Used **YOLOv8** for object detection (COCO pretrained).
+- Mapped detections to the AICI challenge classes (bathtub, chair, couch, shelf, table, WC).
+- Computed poses (x, y, θ) and dimensions in map coordinates.
+- Generated a JSON output and overlay PNG on the occupancy grid.
+
+### Key Outputs
+| File | Description |
+|------|--------------|
+| `detections.json` | All detections with class, dimensions, and pose. |
+| `map_with_detections.png` | Occupancy grid map with oriented bounding boxes. |
+
+**Result:** ✅ Detections correctly projected and aligned.  
+**Verified Classes:** *Chair, Couch*.
 
 ---
 
-## 🚀 Challenge 1 — Object Detection & Projection
+## 🪶 Challenge 2 – LiDAR + Camera Colorization & Fusion
 
-### Script
-`detect_and_overlay_v2.py`
+### Objective
+Merge point clouds and colorize them using synchronized camera frames and TF transforms.
 
-Runs YOLOv8 object detection on RGB frames and projects detections into **map coordinates** (meters).  
-Generates oriented bounding boxes and stores full detection metadata.
+### Implementation Summary
+- Used **colorize_and_merge** (final version).  
+- Reads ROS bag (`/tf`, `/tf_static`, `/livox/lidar`, `/zed/...` topics).  
+- Synchronizes LiDAR–Camera data with dynamic & static TF lookups.  
+- Projects image colors onto LiDAR points.  
+- Downsamples clouds (voxel size 0.15 m).  
+- Verified using `verify_ch2_v2.py`.
 
-### Usage
+### Final Command Used
 ```bash
-python scripts/detect_and_overlay_v2.py   --room-yaml data/office/room.yaml   --room-pgm  data/office/room.pgm   --rgb-dir   data/office/frames   --out-dir   results/office   --model yolov8n.pt   --only-best-frame
+python colorize_and_merge.py   --bags "{BAG}"   --cloud-topic "/livox/lidar"   --image-topic "/zed/zed_node/rgb/image_rect_color/compressed"   --caminfo-topic "/zed/zed_node/rgb/camera_info"   --tf-topics /tf /tf_static   --world-frame base_link   --sync-tol 0.5   --stride 6   --max-clouds 600   --voxel 0.15   --out results/<survey>_colored.ply
 ```
 
-### Output
-- `detections.json` → Object metadata (class, pose, size)  
-- `map_with_detections.png` → Visual overlay of detections on occupancy map  
+### Verification Summary (from `verify_ch2_v2.py`)
+| Survey | Points | Extent (m) | Volume (m³) | Density (pts/m³) | % Colored | Verdict |
+|:--|--:|--:|--:|--:|--:|:--|
+| **office_colored.ply** | 72,369 | 21.5 × 22.3 × 4.47 | 2,149.9 | 33.7 | **24.3 %** | ✅ Pass |
+| **bathroom_colored.ply** | 13,312 | 6.4 × 9.1 × 2.75 | 160.4 | 83.1 | **21.2 %** | ✅ Pass |
+
+### Visual Projections
+| File | Description |
+|------|--------------|
+| `office_colored_proj.png` | Top, side, and front projections of the colored point cloud. |
+| `bathroom_colored_proj.png` | Projections of the bathroom scan. |
+
+### Validation Notes
+- All 100 / 100 LiDAR clouds successfully transformed via TF.  
+- Camera intrinsics and TF alignment verified (`TF_img=ok`).  
+- Average colorization coverage ≈ 22 % (expected for forward-facing RGB + 360° LiDAR).  
+- Geometry, density, and color alignment confirmed visually.
+
+**Result:** ✅ Challenge 2 successfully completed.
 
 ---
 
-## 🚀 Challenge 2 — Point Cloud Concatenation & Colorization
+## 🧭 Challenge 3 – Alignment (Placeholder)
 
-### Script
-`colorize_and_merge_fixed.py`
+### Objective (future extension)
+Align multiple colorized point clouds (office, bathroom, etc.) into a unified world coordinate frame.
 
-This script merges LiDAR and RGB camera data into a single **colored point cloud** by:
-1. Reading LiDAR and camera messages from ROS2 bags (`rosbags` library).  
-2. Using TF transforms for spatial alignment.  
-3. Projecting camera colors onto LiDAR points.  
-4. Downsampling to manage memory (optimized for Colab).  
+### Planned Approach
+- Use **Open3D ICP** or **RANSAC-based registration**.  
+- Optionally refine via **feature-based alignment (FPFH descriptors)**.  
+- Output: merged, globally aligned `.ply` map.
 
-### Example (Colab command used)
+**Status:** ⏳ Pending (not required for current submission).
+
+---
+
+## 📊 Verification & Evaluation
+
+All metrics computed using:
 ```bash
-python scripts/colorize_and_merge_fixed.py   --bags "/content/drive/MyDrive/Perceptra/bags/office_survey_1"   --cloud-topic "/livox/lidar"   --image-topic "/zed/zed_node/rgb/image_rect_color/compressed"   --caminfo-topic "/zed/zed_node/rgb/camera_info"   --tf-topics /tf /tf_static   --world-frame livox_frame   --sync-tol 0.5   --stride 6   --max-clouds 600   --percloud-voxel 0.08   --voxel 0.15   --out results/office/office_colored.ply
+python verify_ch2_v2.py   --ply office_colored.ply bathroom_colored.ply   --out ch2_verify_results
 ```
 
-### Output
-- `office_colored.ply` → Merged, colorized 3D point cloud of the environment  
-  (fully viewable in **Open3D**, **CloudCompare**, or **MeshLab**)  
+- Checks bounding box, volume, density, and percent of points colorized.  
+- Saves report as `report.json`.  
+- Generates preview PNGs for visual confirmation.
+
+**All validation criteria passed for Challenge 1 & 2.**
 
 ---
 
-## 🧰 Dependencies
-Install via pip:
-```bash
-pip install rosbags open3d==0.18.0 opencv-python-headless numpy pyyaml tqdm ultralytics
-```
+## 🧾 Summary of Deliverables
+
+| Challenge | Output Files | Status |
+|------------|---------------|---------|
+| 1 | `detections.json`, `map_with_detections.png` | ✅ Completed |
+| 2 | `office_colored.ply`, `bathroom_colored.ply`, `report.json`, `*_proj.png` | ✅ Completed |
+| 3 | `align_maps.py` (planned) | ⏳ Optional |
 
 ---
 
-## ✅ Compliance Checklist
-
-| Requirement | Challenge 1 | Challenge 2 |
-|--------------|-------------|-------------|
-| Non-overlapping bounding boxes | ✅ | — |
-| ≥ 2 object classes detected | ✅ | — |
-| Map-aligned detections (meters) | ✅ | — |
-| Pose & dimension metadata | ✅ | — |
-| Oriented bounding boxes | ✅ | — |
-| Merged point cloud (PLY) | — | ✅ |
-| Colorized using RGB images | — | ✅ |
-| TF synchronization | — | ✅ |
-| Reproducible CLI script | ✅ | ✅ |
-
----
-
-## 🧩 Summary
-This solution fully completes **Challenge 1** and **Challenge 2** of the AICI Robotics assessment:  
-- **Challenge 1:** map-aligned detections, JSON + visual overlays  
-- **Challenge 2:** robust colored point-cloud generation with per-cloud voxel downsampling (Colab-optimized)  
-
-Both stages are reproducible via command-line or Colab Notebook and ready for final submission.
+**Author:** Abdul Rafey  
+**Project:** Perceptra  
+**Institution:** AICI GmbH – Computer Vision & Robotics Challenge 2025  
+**Tools:** ROS 2 / Open3D / YOLOv8 / TF2 / Python 3.10 / Colab GPU

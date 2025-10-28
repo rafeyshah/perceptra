@@ -1,0 +1,50 @@
+[
+  {
+    "file": "/content/office_colored.ply",
+    "points": 72369,
+    "bbox_min": [
+      -13.527999877929688,
+      -9.784500122070312,
+      -0.7320000529289246
+    ],
+    "bbox_max": [
+      8.010000228881836,
+      12.545999526977539,
+      3.73799991607666
+    ],
+    "extent_m": [
+      21.538000106811523,
+      22.33049964904785,
+      4.469999969005585
+    ],
+    "volume_m3": 2149.865723196875,
+    "density_pts_per_m3": 33.66210234394847,
+    "percent_colored": 24.256242313697854,
+    "preview_open3d": null,
+    "preview_projection": "ch2_verify_results/office_colored_proj.png"
+  },
+  {
+    "file": "/content/bathroom_colored.ply",
+    "points": 13312,
+    "bbox_min": [
+      -2.5614999532699585,
+      -4.11050009727478,
+      -0.06857142597436905
+    ],
+    "bbox_max": [
+      3.8177591192461278,
+      5.020999908447266,
+      2.679999828338623
+    ],
+    "extent_m": [
+      6.379259072516087,
+      9.131500005722046,
+      2.748571254312992
+    ],
+    "volume_m3": 160.11033412166225,
+    "density_pts_per_m3": 83.1426657937312,
+    "percent_colored": 21.161358173076923,
+    "preview_open3d": null,
+    "preview_projection": "ch2_verify_results/bathroom_colored_proj.png"
+  }
+]
